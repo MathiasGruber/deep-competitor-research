@@ -129,7 +129,8 @@ docker exec -it deep-research npm run docker
 Run the research assistant:
 
 ```bash
-npm start
+npm start-dr # Deep Research
+npm start-cip # Competitor Intelligence
 ```
 
 You'll be prompted to:

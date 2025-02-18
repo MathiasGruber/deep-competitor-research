@@ -3,10 +3,13 @@ import { generateObject } from 'ai';
 import { compact } from 'lodash-es';
 import pLimit from 'p-limit';
 import { z } from 'zod';
+import { createObjectCsvWriter } from 'csv-writer';
+import path from 'path';
 
 import { o3MiniModel, trimPrompt } from './ai/providers';
 import { systemPrompt } from './prompt';
 import { OutputManager } from './output-manager';
+import { schema } from './schema';
 
 // Initialize output manager for coordinated console/progress output
 const output = new OutputManager();
@@ -283,4 +286,229 @@ export async function deepResearch({
     learnings: [...new Set(results.flatMap(r => r.learnings))],
     visitedUrls: [...new Set(results.flatMap(r => r.visitedUrls))],
   };
+}
+
+type DrugDiscoveryProgress = {
+  status: 'discovering_drugs' | 'researching_drugs';
+  currentDrug?: string;
+  totalDrugs?: number;
+  completedDrugs: number;
+  currentDepth: number;
+  totalDepth: number;
+  currentBreadth: number;
+  totalBreadth: number;
+  currentQuery?: string;
+  totalQueries: number;
+  completedQueries: number;
+};
+
+// First phase: Discover drugs for a given indication
+async function discoverDrugsForIndication(indication: string, onProgress?: (progress: DrugDiscoveryProgress) => void) {
+  const res = await generateObject({
+    model: o3MiniModel,
+    system: systemPrompt(),
+    prompt: `Given the following disease indication, generate SERP queries to discover all drugs (both approved and in development) for this indication: ${indication}`,
+    schema: z.object({
+      queries: z.array(z.string()),
+    }),
+  });
+
+  const limit = pLimit(ConcurrencyLimit);
+  const allDrugs = new Set<string>();
+  let completedQueries = 0;
+
+  await Promise.all(
+    res.object.queries.map(query =>
+      limit(async () => {
+        try {
+          onProgress?.({
+            status: 'discovering_drugs',
+            completedDrugs: 0,
+            currentDepth: 1,
+            totalDepth: 1,
+            currentBreadth: completedQueries + 1,
+            totalBreadth: res.object.queries.length,
+            totalQueries: res.object.queries.length,
+            completedQueries: completedQueries,
+            currentQuery: query
+          });
+
+          const result = await firecrawl.search(query, {
+            timeout: 15000,
+            limit: 10,
+            scrapeOptions: { formats: ['markdown'] },
+          });
+
+          // Process each search result in parallel
+          const drugPromises = result.data.map(async (item) => {
+            if (!item.markdown) return [];
+            
+            try {
+              const drugsRes = await generateObject({
+                model: o3MiniModel,
+                system: systemPrompt(),
+                prompt: `Given the following search result, extract all drug names (both approved and in development) mentioned for ${indication}. Include both brand names and generic names:\n\n${item.markdown}`,
+                schema: z.object({
+                  drugs: z.array(z.string()),
+                }),
+              });
+              return drugsRes.object.drugs;
+            } catch (e) {
+              log(`Error extracting drugs from content: `, e);
+              return [];
+            }
+          });
+
+          const drugLists = await Promise.all(drugPromises);
+          drugLists.flat().forEach(drug => allDrugs.add(drug));
+          completedQueries++;
+
+        } catch (e) {
+          log(`Error discovering drugs: `, e);
+          completedQueries++;
+        }
+      }),
+    ),
+  );
+
+  return Array.from(allDrugs);
+}
+
+type DrugInfo = z.infer<typeof schema>;
+
+// Second phase: Research specific drug details
+async function researchDrug(drugName: string): Promise<DrugInfo> {
+  const queries = [
+    `${drugName} clinical trials status development phase`,
+    `${drugName} mechanism of action pharmaceutical company`,
+    `${drugName} drug modality administration route`,
+  ];
+
+  const limit = pLimit(ConcurrencyLimit);
+  const searchResults: SearchResponse[] = [];
+
+  await Promise.all(
+    queries.map(query =>
+      limit(async () => {
+        try {
+          const result = await firecrawl.search(query, {
+            timeout: 15000,
+            limit: 5,
+            scrapeOptions: { formats: ['markdown'] },
+          });
+          searchResults.push(result);
+        } catch (e) {
+          log(`Error researching drug ${drugName}: `, e);
+        }
+      }),
+    ),
+  );
+
+  // Process all search results in parallel
+  const processingPromises = searchResults.flatMap(result =>
+    result.data
+      .filter(data => data.markdown)
+      .map(async data => {
+        try {
+          const partialDrugInfo = await generateObject({
+            model: o3MiniModel,
+            system: systemPrompt(),
+            prompt: `Given the following search result about ${drugName}, extract detailed information according to the schema. If you're not confident about certain fields, leave them empty:\n\n${data.markdown}`,
+            schema,
+          });
+          
+          return partialDrugInfo.object as DrugInfo;
+        } catch (e) {
+          log(`Error processing search result for ${drugName}: `, e);
+          return null;
+        }
+      })
+  );
+
+  const drugInfoResults = (await Promise.all(processingPromises)).filter((result): result is DrugInfo => result !== null);
+
+  // Combine all results into a final schema
+  const finalDrugInfo = await generateObject({
+    model: o3MiniModel,
+    system: systemPrompt(),
+    prompt: `Given these different pieces of information about ${drugName}, combine them into a single coherent entry, resolving any conflicts and choosing the most accurate information:\n\n${JSON.stringify(drugInfoResults, null, 2)}`,
+    schema,
+  });
+
+  return finalDrugInfo.object as DrugInfo;
+}
+
+export async function performCompetitorAnalysis(
+  indication: string,
+  onProgress?: (progress: DrugDiscoveryProgress) => void,
+): Promise<DrugInfo[]> {
+  log(`Discovering drugs for ${indication}...`);
+  onProgress?.({
+    status: 'discovering_drugs',
+    completedDrugs: 0,
+    currentDepth: 0,
+    totalDepth: 1,
+    currentBreadth: 0,
+    totalBreadth: 1,
+    totalQueries: 1,
+    completedQueries: 0,
+    currentQuery: 'Initial discovery'
+  });
+
+  const drugs = await discoverDrugsForIndication(indication, onProgress);
+  log(`Discovered ${drugs.length} drugs`);
+
+  // Phase 2: Research each drug
+  const drugDetails: DrugInfo[] = [];
+  let completedDrugs = 0;
+
+  for (const drug of drugs) {
+    onProgress?.({
+      status: 'researching_drugs',
+      currentDrug: drug,
+      totalDrugs: drugs.length,
+      completedDrugs,
+      currentDepth: 1,
+      totalDepth: 1,
+      currentBreadth: completedDrugs + 1,
+      totalBreadth: drugs.length,
+      totalQueries: drugs.length,
+      completedQueries: completedDrugs,
+      currentQuery: drug
+    });
+
+    const details = await researchDrug(drug);
+    drugDetails.push(details);
+    completedDrugs++;
+  }
+
+  // Write results to CSV
+  const csvPath = path.join(process.cwd(), `${indication.toLowerCase().replace(/\s+/g, '-')}-analysis.csv`);
+  const csvWriter = createObjectCsvWriter({
+    path: csvPath,
+    header: [
+      { id: 'drug_name', title: 'Drug Name' },
+      { id: 'api_name', title: 'API Name' },
+      { id: 'status', title: 'Status' },
+      { id: 'drug_modality', title: 'Drug Modality' },
+      { id: 'organization', title: 'Organization' },
+      { id: 'clinical_trial_phase', title: 'Clinical Trial Phase' },
+      { id: 'route_of_administration', title: 'Route of Administration' },
+      { id: 'mode_of_action', title: 'Mode of Action' },
+      // Complex fields as stringified JSON
+      { id: 'description', title: 'Description' },
+      { id: 'references', title: 'References' }
+    ],
+  });
+
+  // Transform complex fields before writing
+  const csvData = drugDetails.map(drug => ({
+    ...drug,
+    description: JSON.stringify(drug.description),
+    references: JSON.stringify(drug.references)
+  }));
+
+  await csvWriter.writeRecords(csvData);
+  log(`CSV file written to: ${csvPath}`);
+  return drugDetails;
 }
